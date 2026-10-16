@@ -1,5 +1,23 @@
-- name: Start AI Bot
-  env:
-    FIREBASE_URL: ${{ secrets.FIREBASE_URL }}
-    PHONE_NUMBER: ${{ secrets.PHONE_NUMBER }}
-  run: npm start
+name: JavaGoat-WhatsApp-Bot
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 */5 * * *'
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - uses: actions/cache@v4
+        with:
+          path: session_data
+          key: javagoat-session
+      - run: npm install
+      - name: Start Bot
+        env:
+          FIREBASE_URL: ${{ secrets.FIREBASE_URL }}
+          PHONE_NUMBER: ${{ secrets.PHONE_NUMBER }}
+        run: npm start
