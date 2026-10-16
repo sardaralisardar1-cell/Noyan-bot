@@ -1,8 +1,5 @@
-name: JavaGoat-WhatsApp-Bot
-on:
-  workflow_dispatch:
-  schedule:
-    - cron: '0 */5 * * *'
+name: JavaGoat-Bot
+on: workflow_dispatch
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -14,10 +11,10 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: session_data
-          key: javagoat-session
+          key: new-session-${{ github.run_id }}
       - run: npm install
       - name: Start Bot
         env:
           FIREBASE_URL: ${{ secrets.FIREBASE_URL }}
           PHONE_NUMBER: ${{ secrets.PHONE_NUMBER }}
-        run: npm start
+        run: node index.js
