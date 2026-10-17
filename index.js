@@ -442,7 +442,7 @@ async function pollOrders(getSock) {
 // ======================= WhatsApp connection =======================
 function startBot() {
     const baileys = require('@whiskeysockets/baileys');
-    const { default: makeWASocket, DisconnectReason, fetchLatestBaileysVersion, makeCacheableSignalKeyStore } = baileys;
+    const { default: makeWASocket, DisconnectReason, fetchLatestBaileysVersion, makeCacheableSignalKeyStore, Browsers } = baileys;
     const pino = require('pino');
     const qrcode = require('qrcode-terminal');
     const logger = pino({ level: 'silent' });
@@ -469,7 +469,7 @@ function startBot() {
             version,
             auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, logger) },
             logger,
-            browser: ['JavaGoat', 'Chrome', '1.0.0'],
+            browser: Browsers.ubuntu('Chrome'),   // must be a standard browser id, custom names break pairing codes
             markOnlineOnConnect: false,
         });
 
@@ -488,7 +488,7 @@ function startBot() {
                         pairingRequested = true;
                         try {
                             const code = await sock.requestPairingCode(pairNum);
-                            console.log(`PAIRING CODE: ${code}   (WhatsApp > Linked devices > Link a device > Link with phone number instead)`);
+                            console.log(`PAIRING CODE for ${pairNum}: ${code}  [${new Date().toISOString()}]  (WhatsApp > Linked devices > Link a device > Link with phone number instead). Use the NEWEST code only.`);
                         } catch (e) {
                             console.log('Pairing code failed, falling back to QR:', e.message);
                             usedPairing = false;
