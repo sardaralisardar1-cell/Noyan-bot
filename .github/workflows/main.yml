@@ -1,17 +1,41 @@
-name: JavaGoat-Bot
-on: workflow_dispatch
+name: JavaGoat-WhatsApp-Bot
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 */5 * * *'
+
+permissions:
+  contents: read
+
+# Only ONE bot may run at a time. A new run cancels the old one, so two
+# copies never fight over the same WhatsApp session (the session itself is
+# stored in Firebase, so the new run just continues where the old one stopped).
+concurrency:
+  group: javagoat-whatsapp-bot
+  cancel-in-progress: true
+
 jobs:
-  build:
+  run-bot:
     runs-on: ubuntu-latest
+    timeout-minutes: 350
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
         with:
           node-version: '20'
-      - name: Install
-        run: npm install
+
+      - name: Install Dependencies
+        run: npm install --omit=dev --no-audit --no-fund
+
       - name: Start Bot
         env:
-          PHONE_NUMBER: ${{ secrets.PHONE_NUMBER }}
           FIREBASE_URL: ${{ secrets.FIREBASE_URL }}
+          FIREBASE_API_KEY: ${{ secrets.FIREBASE_API_KEY }}
+          BOT_EMAIL: ${{ secrets.BOT_EMAIL }}
+          BOT_PASSWORD: ${{ secrets.BOT_PASSWORD }}
+          PAIRING_NUMBER: ${{ secrets.PAIRING_NUMBER }}
         run: node index.js
