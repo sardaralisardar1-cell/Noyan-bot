@@ -12,6 +12,11 @@
  *   BOT_PASSWORD      password of that user
  */
 
+// Privacy: mask long digit runs (phone numbers) in logs, in case the repo / Actions logs are public.
+const _origLog = console.log.bind(console);
+console.log = (...args) => _origLog(...args.map(a => (typeof a === 'string'
+    ? a.replace(/\d{8,}/g, m => m.slice(0, 3) + '***' + m.slice(-2)) : a)));
+
 const FIREBASE_URL = (process.env.FIREBASE_URL || '').replace(/\/+$/, '');
 const FIREBASE_API_KEY = process.env.FIREBASE_API_KEY || '';
 const BOT_EMAIL = process.env.BOT_EMAIL || '';
@@ -146,6 +151,8 @@ async function getSettings() {
         value: {
             isOpen: s.isOpen !== false,
             deliveryFee: (!isNaN(fee) && fee >= 0) ? fee : 50,
+            deliveryEnabled: s.deliveryEnabled !== false,
+            shopAddress: String(s.shopAddress || '').slice(0, 200),
             adminWhatsApp: String(s.adminWhatsApp || '').split(',').map(n => n.replace(/\D/g, '')).filter(Boolean),
             closedMessage: s.closedMessage || 'We are closed right now. Please try again later. 🙏',
         },
@@ -166,20 +173,31 @@ const GREETINGS = new Set(['hi', 'hello', 'hey', 'hii', 'hy', 'salam', 'salaam',
 async function getMenu() {
     const data = (await fbGet('dishes')) || {};
     return Object.entries(data)
-        .map(([id, d]) => ({ id, name: String(d.name || ''), price: parseFloat(d.price), imageUrl: d.imageUrl || '' }))
-        .filter(d => d.name && !isNaN(d.price));
+        .map(([id, d]) => {
+            const num = parseInt(d.number, 10);
+            return {
+                id,
+                name: String(d.name || ''),
+                price: parseFloat(d.price),
+                imageUrl: d.imageUrl || '',
+                number: (Number.isFinite(num) && num > 0) ? num : null,
+            };
+        })
+        .filter(d => d.name && !isNaN(d.price))
+        .sort((a, b) => ((a.number ?? 1e9) - (b.number ?? 1e9)) || a.name.localeCompare(b.name));
 }
 
-function menuText(menu, fee) {
+function menuText(menu, cfg) {
     if (!menu.length) return 'Menu is empty right now. Please check back soon!';
     let t = '🍽️ *JavaGoat Menu*\n\n';
-    menu.forEach(i => { t += `• ${i.name} — ${money(i.price)}\n`; });
-    t += `\n🛵 Delivery: ${money(fee)}\n`;
-    t += '\nTo order, type like this:\n*order 2 pizza, 1 burger*';
+    menu.forEach(i => { t += `${i.number ? `*${i.number}.*` : '•'} ${i.name} — ${money(i.price)}\n`; });
+    t += '\n👉 Order ke liye product ka *number* bhejein (jaise *2*).';
+    t += '\nYa likhein: *order 2 pizza, 1 burger*';
+    t += cfg.deliveryEnabled ? `\n\n🛵 Delivery: ${money(cfg.deliveryFee)} | 🛍️ Pickup: free` : '\n\n🛍️ Abhi sirf shop se pickup available hai.';
     return t;
 }
 
-// Parse "order 2 pizza, 1 burger x2" against the menu.
+// Parse "order 2 pizza, 1 burger x2" against the menu (name based).
 function parseOrderText(raw, menu) {
     const parts = String(raw).split(/,|\n|\+|\band\b/i).map(p => p.trim()).filter(Boolean);
     const found = new Map();
@@ -224,10 +242,15 @@ function totals(items, fee) {
     return { sub, fee, total: sub + fee };
 }
 
-function summaryText(items, fee) {
-    const t = totals(items, fee);
-    let s = items.map(i => `${i.quantity} × ${i.name} — ${money(i.price * i.quantity)}`).join('\n');
-    s += `\n\nSubtotal: ${money(t.sub)}\nDelivery: ${money(t.fee)}\n*Total: ${money(t.total)}*`;
+const itemLines = (items) => items.map(i => `${i.quantity} × ${i.name} — ${money(i.price * i.quantity)}`).join('\n');
+
+// type: 'Delivery' adds a delivery line; anything else (Pickup) has no delivery fee
+function summaryText(items, fee, type) {
+    const t = totals(items, type === 'Delivery' ? fee : 0);
+    let s = itemLines(items);
+    s += `\n\nSubtotal: ${money(t.sub)}`;
+    if (type === 'Delivery') s += `\nDelivery: ${money(t.fee)}`;
+    s += `\n*Total: ${money(t.total)}*`;
     return s;
 }
 
@@ -236,15 +259,26 @@ function extractPhone(text, fallback) {
     return m ? m[0].replace(/[\s-]/g, '') : fallback;
 }
 
+// (id, order, settings) -> text
 const STATUS_MESSAGES = {
     Preparing: (id) => `👨‍🍳 Your order *${id}* is now being prepared!`,
+    'Ready for Pickup': (id, o, cfg) => `✅ Aap ka order *${id}* tayar hai! Shop se utha lein.${cfg.shopAddress ? `\n📍 ${cfg.shopAddress}` : ''}`,
     'Out for Delivery': (id) => `🛵 Your order *${id}* is out for delivery. It will reach you soon!`,
-    Delivered: (id) => `✅ Your order *${id}* has been delivered. Enjoy your meal! Thank you for choosing JavaGoat 💚`,
+    Delivered: (id, o) => (o.orderType === 'Pickup'
+        ? `✅ Order *${id}* aap ko mil gaya. Shukriya! 💚`
+        : `✅ Your order *${id}* has been delivered. Enjoy! Thank you for choosing JavaGoat 💚`),
     Cancelled: (id) => `❌ Your order *${id}* has been cancelled. Type *menu* to order again.`,
 };
 
 // ======================= Message handling =======================
 // `send(jid, content)` is injected so this is testable without WhatsApp.
+//
+// Order flow (state.step):
+//   QTY     -> customer sent a product number, we wait for quantity
+//   TYPE    -> 1 = Pickup (booking only), 2 = Booking + Delivery
+//   NAME    -> pickup: wait for name
+//   ADDRESS -> delivery: wait for name + address (or location pin)
+//   CONFIRM -> 1 = confirm, 2 = cancel
 async function handleIncoming({ jid, text, location, send }) {
     const sender = jid.split('@')[0];
     const raw = String(text || '').trim();
@@ -263,16 +297,16 @@ async function handleIncoming({ jid, text, location, send }) {
 
     // ----- location pin -----
     if (location) {
-        if (!st) return reply('📍 Thanks! Start an order first: type *menu* to see items.');
-        st.location = { lat: String(location.lat), lng: String(location.lng) };
-        if (st.step === 'ADDRESS') {
+        if (!st) return reply('📍 Thanks! Pehle order shuru karein: *menu* likhein ya product ka number bhejein.');
+        if (st.orderType === 'Pickup') return reply('📍 Pickup order mein location ki zaroorat nahi. Jawab dein ya *cancel* likhein.');
+        if (st.step === 'ADDRESS' || st.step === 'CONFIRM') {
+            st.location = { lat: String(location.lat), lng: String(location.lng) };
             await saveState(st);
-            return reply(st.details
-                ? '📍 Location received!' + '\n\n' + confirmText(st, settings)
-                : '📍 Location received! Now please send your *Name & full delivery address* in one message.');
+            return reply(st.step === 'CONFIRM'
+                ? '📍 Location updated!\n\n' + confirmText(st, settings)
+                : '📍 Location received! Ab apna *Naam aur poora address* ek message mein bhejein.');
         }
-        await saveState(st);
-        return reply('📍 Location updated!\n\n' + confirmText(st, settings));
+        return reply('📍 Location baad mein maangenge. Pehle upar wale sawal ka jawab dein.');
     }
 
     if (!raw) return;
@@ -281,14 +315,14 @@ async function handleIncoming({ jid, text, location, send }) {
     const isCmd = (...ws) => words.length === 1 && ws.includes(words[0]);
 
     if (isCmd('help', 'commands')) {
-        return reply('🤖 *How to use JavaGoat bot*\n\n• *menu* — see items & prices\n• *order 2 pizza, 1 burger* — place an order\n• *status* — check your last order\n• *cancel* — cancel your current/last order\n• *contact* — talk to us');
+        return reply('🤖 *How to use JavaGoat bot*\n\n• *menu* — items aur numbers\n• *2* — product number bhejein (details + order)\n• *p3* — koi bhi waqt product 3 dekhein\n• *order 2 pizza, 1 burger* — naam se order\n• *status* — apka aakhri order\n• *cancel* — cancel karein\n• *contact* — hum se baat karein');
     }
     if (isCmd('menu', 'prices', 'price', 'list', 'rates')) {
         const menu = await getMenu();
-        return reply(menuText(menu, settings.deliveryFee));
+        return reply(menuText(menu, settings));
     }
     if (isCmd('contact', 'call', 'support')) {
-        return reply('📞 For help, just reply here and our team will get back to you. Type *menu* to order.');
+        return reply('📞 Madad ke liye yahin message likhein, hamari team jawab degi. Menu ke liye *menu* likhein.');
     }
     if (isCmd('status', 'track')) {
         return replyStatus();
@@ -296,33 +330,63 @@ async function handleIncoming({ jid, text, location, send }) {
     if (isCmd('cancel') && !st) {
         return cancelLastOrder();
     }
-    if (st && NO.has(lower) && (st.step === 'CONFIRM' || st.step === 'ADDRESS' || lower === 'cancel')) {
+    if (st && (lower === 'cancel' || (NO.has(lower) && st.step !== 'NAME' && st.step !== 'ADDRESS'))) {
         await clearState();
-        return reply('❌ Order cancelled. Type *menu* whenever you want to order again.');
+        return reply('❌ Order cancel ho gaya. Dobara order ke liye *menu* likhein.');
     }
 
-    // ----- start / restart an order -----
-    if (/^(order|buy|want|chahiye|mangwa)\b/i.test(raw) || /^order[:\s]/i.test(raw)) {
+    // ----- product by number from anywhere: p3 / product 3 / #3 -----
+    const pm = lower.match(/^(?:p|prod|product|item|#)\s*(\d{1,4})$/);
+    if (pm) return showProduct(parseInt(pm[1], 10));
+
+    // ----- order by name: "order 2 pizza, 1 burger" -----
+    if (/^(order|buy|want|chahiye|mangwa)\b/i.test(raw)) {
         if (!settings.isOpen) return reply(`🔒 ${settings.closedMessage}`);
         const body = raw.replace(/^(order|buy|want|chahiye|mangwa)\b[:\s]*/i, '').trim();
-        if (!body) return reply('What would you like? Example:\n*order 2 pizza, 1 burger*\n\nType *menu* to see items.');
+        if (!body) return reply('Kya chahiye? Product ka number bhejein (jaise *2*) ya likhein:\n*order 2 pizza, 1 burger*\n\n*menu* likhein list ke liye.');
         const menu = await getMenu();
         const { items, problems } = parseOrderText(body, menu);
         if (problems.length) {
-            return reply('⚠️ I could not understand:\n' + problems.map(p => '• ' + p).join('\n') + '\n\nType *menu* to see exact names.');
+            return reply('⚠️ Samajh nahi aaya:\n' + problems.map(p => '• ' + p).join('\n') + '\n\n*menu* likhein, exact naam/number ke liye.');
         }
-        if (!items.length) return reply('Please tell me what you want, e.g. *order 2 pizza*.');
-        await saveState({ step: 'ADDRESS', items, details: null, location: null, jid });
-        const text1 = `🛒 *Your Order*\n${summaryText(items, settings.deliveryFee)}\n\n📝 Now send your *Full Name & Delivery Address* in one message.\n📍 You can also share your Location pin.\nType *cancel* to cancel.`;
-        if (items.length === 1 && items[0].img) {
-            try { await send(jid, { image: { url: items[0].img }, caption: text1 }); return; } catch (_) { /* fall back to text */ }
-        }
-        return reply(text1);
+        if (!items.length) return reply('Batayein kya chahiye, jaise *order 2 pizza*.');
+        return goToTypeStep({ items, details: null, location: null, jid });
     }
 
-    // ----- inside an order draft -----
+    // ----- a bare number -----
+    if (/^\d{1,4}$/.test(raw)) {
+        const n = parseInt(raw, 10);
+        if (!st) return showProduct(n);
+        if (st.step === 'QTY') return setQuantity(n);
+        if (st.step === 'TYPE') return chooseType(n === 1 ? 'Pickup' : n === 2 ? 'Delivery' : null);
+        if (st.step === 'CONFIRM') {
+            if (n === 1) return placeOrder(st);
+            if (n === 2) { await clearState(); return reply('❌ Order cancel ho gaya. Dobara order ke liye *menu* likhein.'); }
+            return reply('Confirm ke liye *1*, cancel ke liye *2* bhejein.');
+        }
+        // NAME / ADDRESS: falls through to the text handlers below
+    }
+
+    // ----- inside an order draft (text answers) -----
+    if (st && st.step === 'QTY') {
+        const m = lower.match(/^(\d{1,3})\s*(?:x|pcs?|pairs?|pair|pieces?)$/);
+        if (m) return setQuantity(parseInt(m[1], 10));
+        return reply(`Quantity number mein bhejein (1 se ${MAX_QTY}), jaise *2*.`);
+    }
+    if (st && st.step === 'TYPE') {
+        if (words.includes('delivery') || words.includes('deliver')) return chooseType('Delivery');
+        if (words.includes('pickup') || words.includes('booking') || words.includes('book')) return chooseType('Pickup');
+        return reply(typeQuestion(st, settings));
+    }
+    if (st && st.step === 'NAME') {
+        if (raw.length < 2) return reply('Apna *naam* bhejein.');
+        st.details = raw.slice(0, 200);
+        st.step = 'CONFIRM';
+        await saveState(st);
+        return reply(confirmText(st, settings));
+    }
     if (st && st.step === 'ADDRESS') {
-        if (raw.length < 10) return reply('Please send your *Name & full delivery address* (a bit more detail please).');
+        if (raw.length < 10) return reply('Apna *Naam aur poora delivery address* bhejein (thodi aur detail ke sath).');
         st.details = raw.slice(0, 500);
         st.step = 'CONFIRM';
         await saveState(st);
@@ -330,40 +394,107 @@ async function handleIncoming({ jid, text, location, send }) {
     }
     if (st && st.step === 'CONFIRM') {
         if (YES.has(lower)) return placeOrder(st);
-        if (raw.length >= 10) {   // treat as corrected address
+        if (st.orderType === 'Delivery' && raw.length >= 10) {   // treat as corrected address
             st.details = raw.slice(0, 500);
             await saveState(st);
-            return reply('✏️ Address updated.\n\n' + confirmText(st, settings));
+            return reply('✏️ Address update ho gaya.\n\n' + confirmText(st, settings));
         }
-        return reply('Reply *yes* to confirm or *no* to cancel.');
+        return reply('Confirm ke liye *1*, cancel ke liye *2* bhejein.');
     }
 
     // ----- greetings / fallback -----
     if (words.some(w => GREETINGS.has(w)) && words.length <= 4) {
-        return reply('👋 Welcome to *JavaGoat*!\n\nType *menu* to see our food, or *help* for all commands.');
+        return reply('👋 Welcome to *JavaGoat*!\n\n*menu* likhein ya seedha product ka *number* bhejein (jaise *2*).\nMadad ke liye *help* likhein.');
     }
-    return reply('I did not get that 🤔\nType *menu* to see items, or *help* for commands.');
+    return reply('Samajh nahi aaya 🤔\n*menu* likhein ya product ka number bhejein, ya *help* likhein.');
 
-    // ---------- inner helpers ----------
+    // ---------- inner helpers (hoisted) ----------
+    async function showProduct(n) {
+        const menu = await getMenu();
+        const item = menu.find(m => m.number === n);
+        if (!item) return reply(`❌ Product number *${n}* nahi mila. Poori list ke liye *menu* likhein.`);
+        if (!settings.isOpen) return reply(`🛍️ *${item.number}. ${item.name}* — ${money(item.price)}\n\n🔒 ${settings.closedMessage}`);
+        await saveState({ step: 'QTY', items: [{ id: item.id, name: item.name, price: item.price, img: item.imageUrl, quantity: null }], orderType: null, details: null, location: null, jid });
+        const cap = `🛍️ *${item.number}. ${item.name}*\nPrice: *${money(item.price)}*\n\n📦 Kitni quantity chahiye? Number bhejein (jaise *1* ya *2*).\n(Doosra product: *p3* | wapas: *cancel*)`;
+        if (item.imageUrl) {
+            try { await send(jid, { image: { url: item.imageUrl }, caption: cap }); return; } catch (_) { /* fall back to text */ }
+        }
+        return reply(cap);
+    }
+
+    async function setQuantity(n) {
+        if (n < 1 || n > MAX_QTY) return reply(`Quantity 1 se ${MAX_QTY} ke beech bhejein.`);
+        st.items[0].quantity = n;
+        return goToTypeStep(st);
+    }
+
+    function typeQuestion(s, cfg) {
+        const sub = totals(s.items, 0).sub;
+        return `🛒 *Your Order*\n${itemLines(s.items)}\nSubtotal: ${money(sub)}\n\nOrder kaise chahiye? Number bhejein:\n*1* — Sirf Booking (shop se khud uthayen, free)\n*2* — Booking + Delivery (delivery ${money(cfg.deliveryFee)})\n\n*cancel* likhein to cancel.`;
+    }
+
+    async function goToTypeStep(s) {
+        if (!settings.isOpen) return reply(`🔒 ${settings.closedMessage}`);
+        if (!settings.deliveryEnabled) {
+            s.orderType = 'Pickup'; s.step = 'NAME';
+            await saveState(s);
+            return reply(`🛒 *Your Order*\n${summaryText(s.items, 0, 'Pickup')}\n\n🛍️ Abhi sirf shop se pickup available hai.\n📝 Booking ke liye apna *naam* bhejein.\n*cancel* likhein to cancel.`);
+        }
+        s.orderType = null; s.step = 'TYPE';
+        await saveState(s);
+        return reply(typeQuestion(s, settings));
+    }
+
+    async function chooseType(kind) {
+        if (!kind) return reply(typeQuestion(st, settings));
+        if (kind === 'Delivery' && !settings.deliveryEnabled) { kind = 'Pickup'; }
+        st.orderType = kind;
+        if (kind === 'Pickup') {
+            st.step = 'NAME';
+            await saveState(st);
+            return reply('🛍️ *Pickup / Booking*\n\n📝 Apna *naam* bhejein (booking isi naam se hogi).\n*cancel* likhein to cancel.');
+        }
+        st.step = 'ADDRESS';
+        await saveState(st);
+        return reply('🛵 *Booking + Delivery*\n\n📝 Apna *Naam aur poora delivery address* ek message mein bhejein.\n📍 Chahein to Location pin bhi share kar sakte hain.\n*cancel* likhein to cancel.');
+    }
+
     function confirmText(s, cfg) {
-        return `📋 *Please confirm your order*\n\n${summaryText(s.items, cfg.deliveryFee)}\n\n👤 ${s.details}\n📍 Location pin: ${s.location ? 'received ✅' : 'not shared (optional)'}\n\nReply *yes* to confirm or *no* to cancel.\n(Send a new address to change it.)`;
+        const isPickup = s.orderType === 'Pickup';
+        let t = `📋 *Please confirm your order*\n\n${summaryText(s.items, cfg.deliveryFee, s.orderType)}\n\n`;
+        if (isPickup) {
+            t += `🛍️ *Pickup (shop se)*\n👤 ${s.details}`;
+            if (cfg.shopAddress) t += `\n📍 ${cfg.shopAddress}`;
+            t += '\n\nConfirm ke liye *1*, cancel ke liye *2* bhejein.';
+        } else {
+            t += `🛵 *Delivery*\n👤 ${s.details}\n📍 Location pin: ${s.location ? 'received ✅' : 'not shared (optional)'}`;
+            t += '\n\nConfirm ke liye *1*, cancel ke liye *2* bhejein.\n(Address badalna ho to naya address bhejein.)';
+        }
+        return t;
     }
 
     async function placeOrder(s) {
         const cfg = await getSettings();
         if (!cfg.isOpen) { await clearState(); return reply(`🔒 ${cfg.closedMessage}`); }
-        const t = totals(s.items, cfg.deliveryFee);
+        const isPickup = s.orderType === 'Pickup';
+        if (!isPickup && !cfg.deliveryEnabled) {
+            await clearState();
+            return reply('🚫 Delivery abhi band hai. Dobara order karein aur *1* (Pickup) chunein.');
+        }
+        const fee = isPickup ? 0 : cfg.deliveryFee;
+        const t = totals(s.items, fee);
         const order = {
             userId: `whatsapp_${sender}`,
             userEmail: `WhatsApp: ${sender}`,
             phone: extractPhone(s.details, sender),
-            address: s.details,
-            location: s.location || { lat: '', lng: '' },
+            address: isPickup ? `Pickup (shop se) — ${s.details}` : s.details,
+            location: (!isPickup && s.location) ? s.location : { lat: '', lng: '' },
             items: s.items.map(i => ({ id: i.id, name: i.name, price: i.price, quantity: i.quantity, img: i.img || '' })),
-            deliveryFee: cfg.deliveryFee,
+            deliveryFee: fee,
+            orderType: isPickup ? 'Pickup' : 'Delivery',
             total: t.total.toFixed(2),
             status: 'Placed',
-            method: 'Cash on Delivery (WhatsApp)',
+            method: isPickup ? 'Pay at Shop (WhatsApp)' : 'Cash on Delivery (WhatsApp)',
             timestamp: new Date().toISOString(),
             waJid: jid,
             waNotified: 'Placed',
@@ -371,7 +502,10 @@ async function handleIncoming({ jid, text, location, send }) {
         };
         const r = await fbPost('orders', order);
         await clearState();
-        return reply(`✅ *Order placed!*\n\nOrder ID: *${shortId(r.name)}*\nTotal: *${money(t.total)}* (pay on delivery)\n\nType *status* anytime to track it. Thank you! 💚`);
+        if (isPickup) {
+            return reply(`✅ *Booking ho gayi!*\n\nOrder ID: *${shortId(r.name)}*\nTotal: *${money(t.total)}* (shop par pay karein)${cfg.shopAddress ? `\n📍 ${cfg.shopAddress}` : ''}\n\nOrder tayar hote hi hum aap ko yahin message karenge. *status* likh kar bhi check kar sakte hain. Shukriya! 💚`);
+        }
+        return reply(`✅ *Order placed!*\n\nOrder ID: *${shortId(r.name)}*\nTotal: *${money(t.total)}* (delivery par pay karein)\n\n*status* likh kar kisi bhi waqt track karein. Shukriya! 💚`);
     }
 
     async function latestOrder() {
@@ -383,19 +517,19 @@ async function handleIncoming({ jid, text, location, send }) {
 
     async function replyStatus() {
         const o = await latestOrder();
-        if (!o) return reply('You have no orders yet. Type *menu* to start! 🍽️');
+        if (!o) return reply('Abhi tak koi order nahi hai. *menu* likh kar shuru karein! 🍽️');
         const items = (o.items || []).map(i => `${i.quantity} × ${i.name}`).join(', ');
-        return reply(`📦 *Order ${shortId(o.k)}*\n${items}\nTotal: ${money(parseFloat(o.total))}\nStatus: *${o.status}*`);
+        return reply(`📦 *Order ${shortId(o.k)}*\n${o.orderType === 'Pickup' ? '🛍️ Pickup' : '🛵 Delivery'}\n${items}\nTotal: ${money(parseFloat(o.total))}\nStatus: *${o.status}*`);
     }
 
     async function cancelLastOrder() {
         const o = await latestOrder();
-        if (!o) return reply('You have no orders to cancel.');
+        if (!o) return reply('Cancel karne ke liye koi order nahi hai.');
         if (o.status !== 'Placed') {
-            return reply(`Order ${shortId(o.k)} is already *${o.status}*, so it cannot be cancelled here. Please contact us.`);
+            return reply(`Order ${shortId(o.k)} ab *${o.status}* hai, yahan se cancel nahi ho sakta. Please humse rabta karein.`);
         }
         await fbPatch(`orders/${o.k}`, { status: 'Cancelled', waNotified: 'Cancelled' });
-        return reply(`❌ Order *${shortId(o.k)}* has been cancelled.`);
+        return reply(`❌ Order *${shortId(o.k)}* cancel ho gaya.`);
     }
 }
 
@@ -414,17 +548,18 @@ async function pollOrders(getSock) {
             // 1) tell WhatsApp customers when admin changes their order status
             if (o.waJid && o.status && o.waNotified !== o.status) {
                 const msg = STATUS_MESSAGES[o.status];
-                if (msg) { try { await sock.sendMessage(o.waJid, { text: msg(shortId(key)) }); } catch (e) { console.log('status notify failed:', e.message); } }
+                if (msg) { try { await sock.sendMessage(o.waJid, { text: msg(shortId(key), o, settings) }); } catch (e) { console.log('status notify failed:', e.message); } }
                 await fbPatch(`orders/${key}`, { waNotified: o.status });
             }
             // 2) alert admin(s) on WhatsApp about new orders (app + WhatsApp)
             if (!o.adminNotified && o.status === 'Placed' && Date.now() - new Date(o.timestamp).getTime() < ADMIN_ALERT_MAX_AGE_MS) {
+                const isPickup = o.orderType === 'Pickup';
                 const lat = parseFloat(o.location && o.location.lat), lng = parseFloat(o.location && o.location.lng);
                 const items = (o.items || []).map(i => `${i.quantity} × ${i.name}`).join('\n');
                 const alert =
-                    `🔔 *New order ${shortId(key)}*\n\n${items}\n\nTotal: *${money(parseFloat(o.total))}*\n` +
+                    `🔔 *New order ${shortId(key)}*\n${isPickup ? '🛍️ PICKUP (booking only)' : '🛵 DELIVERY'}\n\n${items}\n\nTotal: *${money(parseFloat(o.total))}*\n` +
                     `📞 ${o.phone || '-'}\n📍 ${o.address || '-'}` +
-                    ((lat && lng) ? `\n🗺️ https://maps.google.com/?q=${lat},${lng}` : '') +
+                    ((!isPickup && lat && lng) ? `\n🗺️ https://maps.google.com/?q=${lat},${lng}` : '') +
                     `\n\nVia: ${o.method || 'App'}`;
                 for (const n of settings.adminWhatsApp) {
                     try { await sock.sendMessage(`${n}@s.whatsapp.net`, { text: alert }); } catch (e) { console.log('admin alert failed:', e.message); }
@@ -488,16 +623,21 @@ function startBot() {
                         pairingRequested = true;
                         try {
                             const code = await sock.requestPairingCode(pairNum);
-                            console.log(`PAIRING CODE for ${pairNum}: ${code}  [${new Date().toISOString()}]  (WhatsApp > Linked devices > Link a device > Link with phone number instead). Use the NEWEST code only.`);
+                            console.log(`PAIRING CODE: ${code}  [${new Date().toISOString()}]  (WhatsApp > Linked devices > Link a device > Link with phone number instead). Use the NEWEST code only.`);
                         } catch (e) {
-                            console.log('Pairing code failed, falling back to QR:', e.message);
+                            console.log('Pairing code failed:', e.message);
                             usedPairing = false;
                         }
                     }
                 }
                 if (!usedPairing) {
-                    console.log('Scan this QR with WhatsApp (Linked Devices):');
-                    qrcode.generate(qr, { small: true });
+                    // A QR in a PUBLIC repo's Actions log could be scanned by anyone -> hidden unless ALLOW_QR=1
+                    if (process.env.ALLOW_QR === '1') {
+                        console.log('Scan this QR with WhatsApp (Linked Devices):');
+                        qrcode.generate(qr, { small: true });
+                    } else {
+                        console.log('Not linked yet. Set the PAIRING_NUMBER secret (QR is hidden for safety) and run again.');
+                    }
                 }
             }
             if (connection === 'open') {
@@ -528,7 +668,7 @@ function startBot() {
                     if (!msg.message || msg.key.fromMe) continue;
                     const jid = msg.key.remoteJid || '';
                     if (!(jid.endsWith('@s.whatsapp.net') || jid.endsWith('@lid'))) continue; // private chats only
-                    if (tooFast(jid)) { console.log('rate-limited', jid); continue; }
+                    if (tooFast(jid)) continue;
 
                     let c = msg.message;
                     c = (c.ephemeralMessage && c.ephemeralMessage.message) || c;
