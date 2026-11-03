@@ -28,6 +28,51 @@ const POLL_WINDOW_MS = 12 * 60 * 60 * 1000;
 const ADMIN_ALERT_MAX_AGE_MS = 30 * 60 * 1000;
 const MAX_QTY = 20;
 
+// ======================= Voice notes (your own recordings) =======================
+// Put recordings in the repo folder  voice/  with these names (any one of .opus .ogg .m4a .aac .mp3):
+//   welcome  (sent after the greeting)      menu    (sent after the menu)       help   (sent after "help")
+//   type     (explains 1 = pickup, 2 = delivery)   name / address (what to type)  confirm  done (optional)
+// A missing file is simply skipped. Text is always sent first, then the voice note.
+const fs = require('fs');
+const path = require('path');
+const VOICE_DIR = process.env.VOICE_DIR || path.join(__dirname, 'voice');
+const VOICE_COOLDOWN_MS = 10 * 60 * 1000;   // same clip is not repeated to one customer within 10 min
+const voiceCache = new Map();               // name -> { at, value }
+const voiceSentAt = new Map();              // `${jid}|${name}` -> timestamp
+
+function loadVoice(name) {
+    const hit = voiceCache.get(name);
+    if (hit && (hit.value || Date.now() - hit.at < 5 * 60 * 1000)) return hit.value;   // re-check missing files every 5 min
+    let value = null;
+    for (const ext of ['opus', 'ogg', 'm4a', 'aac', 'mp3']) {
+        const p = path.join(VOICE_DIR, `${name}.${ext}`);
+        try {
+            if (fs.existsSync(p)) {
+                const mimetype = (ext === 'opus' || ext === 'ogg') ? 'audio/ogg; codecs=opus' : (ext === 'mp3' ? 'audio/mpeg' : 'audio/mp4');
+                value = { buf: fs.readFileSync(p), mimetype };
+                break;
+            }
+        } catch (_) { /* ignore unreadable file */ }
+    }
+    voiceCache.set(name, { at: Date.now(), value });
+    return value;
+}
+
+// Never throws: a voice problem must never break an order.
+async function sendVoice(send, jid, name) {
+    try {
+        const v = loadVoice(name);
+        if (!v) return;
+        const key = `${jid}|${name}`;
+        if (Date.now() - (voiceSentAt.get(key) || 0) < VOICE_COOLDOWN_MS) return;
+        if (voiceSentAt.size > 5000) voiceSentAt.clear();
+        voiceSentAt.set(key, Date.now());
+        await send(jid, { audio: v.buf, mimetype: v.mimetype, ptt: true });
+    } catch (e) {
+        console.log('voice send failed:', e.message);
+    }
+}
+
 // ======================= Firebase REST (authenticated) =======================
 const tokenCache = { idToken: null, refreshToken: null, exp: 0, pending: null };
 
@@ -285,6 +330,7 @@ async function handleIncoming({ jid, text, location, send }) {
     const lower = raw.toLowerCase();
     const words = tokens(raw);
     const reply = (t) => send(jid, { text: t });
+    const replyV = async (t, voice) => { await reply(t); await sendVoice(send, jid, voice); };
     const sk = stateKey(jid);
 
     const settings = await getSettings();
@@ -315,11 +361,11 @@ async function handleIncoming({ jid, text, location, send }) {
     const isCmd = (...ws) => words.length === 1 && ws.includes(words[0]);
 
     if (isCmd('help', 'commands')) {
-        return reply('🤖 *How to use JavaGoat bot*\n\n• *menu* — items aur numbers\n• *2* — product number bhejein (details + order)\n• *p3* — koi bhi waqt product 3 dekhein\n• *order 2 pizza, 1 burger* — naam se order\n• *status* — apka aakhri order\n• *cancel* — cancel karein\n• *contact* — hum se baat karein');
+        return replyV('🤖 *How to use JavaGoat bot*\n\n• *menu* — items aur numbers\n• *2* — product number bhejein (details + order)\n• *p3* — koi bhi waqt product 3 dekhein\n• *order 2 pizza, 1 burger* — naam se order\n• *status* — apka aakhri order\n• *cancel* — cancel karein\n• *contact* — hum se baat karein', 'help');
     }
     if (isCmd('menu', 'prices', 'price', 'list', 'rates')) {
         const menu = await getMenu();
-        return reply(menuText(menu, settings));
+        return replyV(menuText(menu, settings), 'menu');
     }
     if (isCmd('contact', 'call', 'support')) {
         return reply('📞 Madad ke liye yahin message likhein, hamari team jawab degi. Menu ke liye *menu* likhein.');
@@ -383,14 +429,14 @@ async function handleIncoming({ jid, text, location, send }) {
         st.details = raw.slice(0, 200);
         st.step = 'CONFIRM';
         await saveState(st);
-        return reply(confirmText(st, settings));
+        return replyV(confirmText(st, settings), 'confirm');
     }
     if (st && st.step === 'ADDRESS') {
         if (raw.length < 10) return reply('Apna *Naam aur poora delivery address* bhejein (thodi aur detail ke sath).');
         st.details = raw.slice(0, 500);
         st.step = 'CONFIRM';
         await saveState(st);
-        return reply(confirmText(st, settings));
+        return replyV(confirmText(st, settings), 'confirm');
     }
     if (st && st.step === 'CONFIRM') {
         if (YES.has(lower)) return placeOrder(st);
@@ -404,7 +450,7 @@ async function handleIncoming({ jid, text, location, send }) {
 
     // ----- greetings / fallback -----
     if (words.some(w => GREETINGS.has(w)) && words.length <= 4) {
-        return reply('👋 Welcome to *JavaGoat*!\n\n*menu* likhein ya seedha product ka *number* bhejein (jaise *2*).\nMadad ke liye *help* likhein.');
+        return replyV('👋 Welcome to *JavaGoat*!\n\n*menu* likhein ya seedha product ka *number* bhejein (jaise *2*).\nMadad ke liye *help* likhein.', 'welcome');
     }
     return reply('Samajh nahi aaya 🤔\n*menu* likhein ya product ka number bhejein, ya *help* likhein.');
 
@@ -438,11 +484,11 @@ async function handleIncoming({ jid, text, location, send }) {
         if (!settings.deliveryEnabled) {
             s.orderType = 'Pickup'; s.step = 'NAME';
             await saveState(s);
-            return reply(`🛒 *Your Order*\n${summaryText(s.items, 0, 'Pickup')}\n\n🛍️ Abhi sirf shop se pickup available hai.\n📝 Booking ke liye apna *naam* bhejein.\n*cancel* likhein to cancel.`);
+            return replyV(`🛒 *Your Order*\n${summaryText(s.items, 0, 'Pickup')}\n\n🛍️ Abhi sirf shop se pickup available hai.\n📝 Booking ke liye apna *naam* bhejein.\n*cancel* likhein to cancel.`, 'name');
         }
         s.orderType = null; s.step = 'TYPE';
         await saveState(s);
-        return reply(typeQuestion(s, settings));
+        return replyV(typeQuestion(s, settings), 'type');
     }
 
     async function chooseType(kind) {
@@ -452,11 +498,11 @@ async function handleIncoming({ jid, text, location, send }) {
         if (kind === 'Pickup') {
             st.step = 'NAME';
             await saveState(st);
-            return reply('🛍️ *Pickup / Booking*\n\n📝 Apna *naam* bhejein (booking isi naam se hogi).\n*cancel* likhein to cancel.');
+            return replyV('🛍️ *Pickup / Booking*\n\n📝 Apna *naam* bhejein (booking isi naam se hogi).\n*cancel* likhein to cancel.', 'name');
         }
         st.step = 'ADDRESS';
         await saveState(st);
-        return reply('🛵 *Booking + Delivery*\n\n📝 Apna *Naam aur poora delivery address* ek message mein bhejein.\n📍 Chahein to Location pin bhi share kar sakte hain.\n*cancel* likhein to cancel.');
+        return replyV('🛵 *Booking + Delivery*\n\n📝 Apna *Naam aur poora delivery address* ek message mein bhejein.\n📍 Chahein to Location pin bhi share kar sakte hain.\n*cancel* likhein to cancel.', 'address');
     }
 
     function confirmText(s, cfg) {
@@ -503,9 +549,9 @@ async function handleIncoming({ jid, text, location, send }) {
         const r = await fbPost('orders', order);
         await clearState();
         if (isPickup) {
-            return reply(`✅ *Booking ho gayi!*\n\nOrder ID: *${shortId(r.name)}*\nTotal: *${money(t.total)}* (shop par pay karein)${cfg.shopAddress ? `\n📍 ${cfg.shopAddress}` : ''}\n\nOrder tayar hote hi hum aap ko yahin message karenge. *status* likh kar bhi check kar sakte hain. Shukriya! 💚`);
+            return replyV(`✅ *Booking ho gayi!*\n\nOrder ID: *${shortId(r.name)}*\nTotal: *${money(t.total)}* (shop par pay karein)${cfg.shopAddress ? `\n📍 ${cfg.shopAddress}` : ''}\n\nOrder tayar hote hi hum aap ko yahin message karenge. *status* likh kar bhi check kar sakte hain. Shukriya! 💚`, 'done');
         }
-        return reply(`✅ *Order placed!*\n\nOrder ID: *${shortId(r.name)}*\nTotal: *${money(t.total)}* (delivery par pay karein)\n\n*status* likh kar kisi bhi waqt track karein. Shukriya! 💚`);
+        return replyV(`✅ *Order placed!*\n\nOrder ID: *${shortId(r.name)}*\nTotal: *${money(t.total)}* (delivery par pay karein)\n\n*status* likh kar kisi bhi waqt track karein. Shukriya! 💚`, 'done');
     }
 
     async function latestOrder() {
@@ -678,7 +724,13 @@ function startBot() {
 
                     await handleIncoming({
                         jid, text, location: loc,
-                        send: (to, content) => sock.sendMessage(to, content),
+                        send: async (to, content) => {
+                            if (content.audio) {
+                                try { await sock.sendPresenceUpdate('recording', to); } catch (_) { /* ignore */ }
+                                await new Promise(r => setTimeout(r, 1500));
+                            }
+                            return sock.sendMessage(to, content);
+                        },
                     });
                 } catch (e) {
                     console.log('handler error:', e.message);
